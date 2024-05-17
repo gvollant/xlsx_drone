@@ -755,6 +755,10 @@ static xlsx_cell_category get_related_category(const char *format_code, int form
 *   - current_analyzed_index: the index pointing to a specific char of *format_code*.
 */
 static xlsx_formatter get_formatter(const char *format_code, int current_analyzed_index) {
+  int length_format_code = (int)strlen(format_code);
+  if (current_analyzed_index >= length_format_code)
+    return XLSX_FORMATTER_UNKNOWN;
+
   switch(format_code[current_analyzed_index]) {
     case 'm': case 'h': case 's': case 'y': case 'd': {
       // "[Red]" case
@@ -829,6 +833,9 @@ static xlsx_formatter get_formatter(const char *format_code, int current_analyze
             if((++i == current_analyzed_index) && (!quotes_open)) {
               // char definitely not escaped
               continue_loop = false;
+            }
+            if(i >= length_format_code) {
+              return XLSX_FORMATTER_UNKNOWN;
             }
           }
         }
