@@ -55,6 +55,10 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
 #endif
   // non-Windows users use mkdtemp() procedure
   const char *temp_folder = WINDOWS ? tmpnam(NULL) : "/XXXXXX";
+#if WINDOWS
+  if ((temp_folder[0]!='\0') && (temp_folder[1]==':') && (temp_folder[2]=='\\'))
+      temp_path="";
+#endif
   int deployed_xlsx_path_len = (int)strlen(temp_path) + (int)strlen(temp_folder);
   char *deployed_xlsx_path = malloc(sizeof(char) * (deployed_xlsx_path_len + 1));
   if(!deployed_xlsx_path) {
@@ -1029,26 +1033,47 @@ static XMLNode * find_cell_node(XMLNode *row, const char *cell) {
 *     - if style != NULL, inspect style.related_category to see what it is
 */
 static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t * cell_data_holder) {
+  // Apache POI set "r", then "t" and "s" attributes, but other XLSX generators set first "r", "s" then "t"
+  int pos_attr_sheet_type, pos_attr_sheet_style;
+  for(pos_attr_sheet_type = 0; pos_attr_sheet_type < cell->n_attributes;
+         ++pos_attr_sheet_type) {
+    if (strcmp(cell->attributes[pos_attr_sheet_type].name, SHEET_TYPE_ATTR_NAME) == 0)
+      break;
+  }
+  for(pos_attr_sheet_style = 0; pos_attr_sheet_style < cell->n_attributes;
+         ++pos_attr_sheet_style) {
+    if (strcmp(cell->attributes[pos_attr_sheet_style].name, SHEET_STYLE_ATTR_NAME) == 0)
+      break;
+  }
 
   // check if has "t"
-  if(strcmp(cell->attributes[cell->n_attributes - 1].name, SHEET_TYPE_ATTR_NAME) == 0) {
+  if(pos_attr_sheet_type != cell->n_attributes) {
 
     // is some kind of text
     cell_data_holder->value_type = XLSX_POINTER_TO_CHAR;
     // check which one
-    if(strcmp(cell->attributes[cell->n_attributes - 1].value, "s") == 0) {
+    if(strcmp(cell->attributes[pos_attr_sheet_type].value, "s") == 0) {
       // it's a shared string
       int shared_strings_index = (int)strtol(cell->children[cell->n_children - 1]->text, NULL, 10);
       cell_data_holder->value.pointer_to_char_value = \
         sheet->xlsx->shared_strings_xml->nodes[1]->children[shared_strings_index]->children[0]->text;
       // it could have some associated style (i.e.: see sample.xlsx cell E21)
-      if(strcmp(cell->attributes[cell->n_attributes - 2].name, SHEET_STYLE_ATTR_NAME) == 0) {
-        int style_index = (int)strtol(cell->attributes[cell->n_attributes - 2].value, NULL, 10);
+      if (pos_attr_sheet_style != cell->n_attributes) {
+        int style_index = (int)strtol(cell->attributes[pos_attr_sheet_style].value, NULL, 10);
         cell_data_holder->style = sheet->xlsx->styles[style_index];
       }
     } else {
-      // it's an inlineStr or an error. An error doesn't have style associated.
-      cell_data_holder->value.pointer_to_char_value = cell->children[cell->n_children - 1]->text;
+      // it's an inlineStr or an error. An error doesn't have style associated, EXCEPT for xlsx from apache POI !
+
+      if(pos_attr_sheet_style != cell->n_attributes) {
+        // could be a complex type
+        int style_index = (int)strtol(cell->attributes[pos_attr_sheet_style].value, NULL, 10);
+        cell_data_holder->style = sheet->xlsx->styles[style_index];
+        // save the value where it should be
+        set_cell_data_values_for_number(cell->children[cell->n_children - 1]->text, cell_data_holder);
+      } else {
+        cell_data_holder->value.pointer_to_char_value = cell->children[cell->n_children - 1]->text;
+      }
     }
 
   } else if(cell->n_children == 0) {
@@ -1062,10 +1087,10 @@ static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t 
     const char *cell_text = cell->children[cell->n_children - 1]->text;
     if(cell_text) {
       // check if it's a plain number or could be a complex type
-      if(strcmp(cell->attributes[cell->n_attributes - 1].name, SHEET_STYLE_ATTR_NAME) == 0) {
+      if(pos_attr_sheet_style != cell->n_attributes) {
 
         // could be a complex type
-        int style_index = (int)strtol(cell->attributes[cell->n_attributes - 1].value, NULL, 10);
+        int style_index = (int)strtol(cell->attributes[pos_attr_sheet_style].value, NULL, 10);
         cell_data_holder->style = sheet->xlsx->styles[style_index];
         // save the value where it should be
         set_cell_data_values_for_number(cell_text, cell_data_holder);
