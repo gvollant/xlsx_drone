@@ -1018,6 +1018,26 @@ static XMLNode * find_cell_node(XMLNode *row, const char *cell) {
   return NULL;
 }
 
+/*
+* summary:
+*   Get text from cell, with or without <is> tag
+* params:
+*   cell: XMLNode * returned by a call to find_cell_node().
+* returns:
+*   text of the cell: if found.
+*   NULL: if not found.
+*/
+static char *get_cell_text(XMLNode *cell)
+{
+  if (cell->n_children == 0)
+    return NULL;
+  if (cell->children[cell->n_children - 1]->text!=NULL)
+    return cell->children[cell->n_children - 1]->text;
+  if ((cell->children[cell->n_children - 1]->n_children > 0) && (cell->children[cell->n_children - 1]->tag != NULL) &&
+      (strcmp(cell->children[cell->n_children - 1]->tag, "is") == 0))
+    return cell->children[cell->n_children - 1]->children[cell->children[cell->n_children - 1]->n_children - 1]->text;
+  return NULL;
+}
 
 /*
 * summary:
@@ -1054,7 +1074,7 @@ static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t 
     // check which one
     if(strcmp(cell->attributes[pos_attr_sheet_type].value, "s") == 0) {
       // it's a shared string
-      int shared_strings_index = (int)strtol(cell->children[cell->n_children - 1]->text, NULL, 10);
+      int shared_strings_index = (int)strtol(get_cell_text(cell), NULL, 10);
       cell_data_holder->value.pointer_to_char_value = \
         sheet->xlsx->shared_strings_xml->nodes[1]->children[shared_strings_index]->children[0]->text;
       // it could have some associated style (i.e.: see sample.xlsx cell E21)
@@ -1070,9 +1090,9 @@ static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t 
         int style_index = (int)strtol(cell->attributes[pos_attr_sheet_style].value, NULL, 10);
         cell_data_holder->style = sheet->xlsx->styles[style_index];
         // save the value where it should be
-        set_cell_data_values_for_number(cell->children[cell->n_children - 1]->text, cell_data_holder);
+        set_cell_data_values_for_number(get_cell_text(cell), cell_data_holder);
       } else {
-        cell_data_holder->value.pointer_to_char_value = cell->children[cell->n_children - 1]->text;
+        cell_data_holder->value.pointer_to_char_value = get_cell_text(cell);
       }
     }
 
@@ -1084,7 +1104,7 @@ static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t 
   } else {
 
     // it's not a string, check if has value
-    const char *cell_text = cell->children[cell->n_children - 1]->text;
+    const char *cell_text = get_cell_text(cell);
     if(cell_text) {
       // check if it's a plain number or could be a complex type
       if(pos_attr_sheet_style != cell->n_attributes) {
