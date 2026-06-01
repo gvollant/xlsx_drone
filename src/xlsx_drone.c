@@ -916,13 +916,22 @@ static int parse_sheet(int sheet_number, xlsx_sheet_t * sheet) {
     int row_node_index, attr_index;
     XMLNode *row;
     for(row_node_index = sheet_data_node->n_children - 1; row_node_index >= 0; --row_node_index) {
+      XMLNode *node_found;
       row = sheet_data_node->children[row_node_index];
       // check out if it has content (seek inside a <v> with content)
       XMLSearch_free(&search_engine, false);
       XMLSearch_init(&search_engine);
       XMLSearch_search_set_tag(&search_engine, SHEET_VALUE_TAG);
       XMLSearch_search_set_text(&search_engine, "*?*");
-      if(XMLSearch_next(row, &search_engine)) {
+      node_found = XMLSearch_next(row, &search_engine);
+      if (!node_found) {
+        XMLSearch_free(&search_engine, false);
+        XMLSearch_init(&search_engine);
+        XMLSearch_search_set_tag(&search_engine, SHEET_TYPE_ATTR_NAME);
+        XMLSearch_search_set_text(&search_engine, "*?*");
+        node_found = XMLSearch_next(row, &search_engine);
+      }
+      if(node_found) {
         for(attr_index = 0; attr_index < row->n_attributes; ++attr_index) {
           if(strcmp(row->attributes[attr_index].name, SHEET_ROW_ATTR_NAME) == 0) {
             sheet->last_row = (int)strtol(row->attributes[attr_index].value, NULL, 10);
@@ -1034,7 +1043,7 @@ static char *get_cell_text(XMLNode *cell)
   if (cell->children[cell->n_children - 1]->text!=NULL)
     return cell->children[cell->n_children - 1]->text;
   if ((cell->children[cell->n_children - 1]->n_children > 0) && (cell->children[cell->n_children - 1]->tag != NULL) &&
-      (strcmp(cell->children[cell->n_children - 1]->tag, "is") == 0))
+      (strcmp(cell->children[cell->n_children - 1]->tag, SHEET_INLINESTR_TAG) == 0))
     return cell->children[cell->n_children - 1]->children[cell->children[cell->n_children - 1]->n_children - 1]->text;
   return NULL;
 }
@@ -1082,6 +1091,8 @@ static void interpret_cell_node(XMLNode *cell, xlsx_sheet_t *sheet, xlsx_cell_t 
         int style_index = (int)strtol(cell->attributes[pos_attr_sheet_style].value, NULL, 10);
         cell_data_holder->style = sheet->xlsx->styles[style_index];
       }
+    } else if(strcmp(cell->attributes[pos_attr_sheet_type].value, "inlineStr") == 0) {
+      cell_data_holder->value.pointer_to_char_value = get_cell_text(cell);
     } else {
       // it's an inlineStr or an error. An error doesn't have style associated, EXCEPT for xlsx from apache POI !
 

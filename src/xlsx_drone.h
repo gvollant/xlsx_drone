@@ -96,6 +96,7 @@ extern "C" {
 #define SHEET_ROW_TAG "row"
 #define SHEET_COL_TAG "c"
 #define SHEET_VALUE_TAG "v"
+#define SHEET_INLINESTR_TAG "is"
 
 
 // structures
