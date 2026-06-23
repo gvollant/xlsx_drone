@@ -27,14 +27,96 @@ int xlsx_get_xlsx_errno(void) {
 }
 
 /*
+* summary:
+*   Builds "<deployment_path><rel_path>" and parses that XML file into *doc*.
+*   Replaces the per-call _alloca()/VLA pattern (a single heap allocation, freed
+*   before returning, works the same on every compiler/OS).
+* returns:
+*   -  1: success.
+*   -  0: parse failure or file not present (sxmlc already freed *doc* in that case).
+*   - -1: the path buffer couldn't be allocated (caller should map to OUT_OF_MEMORY).
+*/
+static int parse_xml_from_deployment(const char *deployment_path, const char *rel_path, XMLDoc *doc)
+{
+  XMLDoc_init(doc);
+  size_t len = strlen(deployment_path) + strlen(rel_path);
+  char *path = malloc(len + 1);
+  if(!path)
+    return -1;
+  strcpy(path, deployment_path);
+  strcat(path, rel_path);
+  path[len] = '\0';
+  int ok = XMLDoc_parse_file_DOM(path, doc);
+  free(path);
+  return ok ? 1 : 0;
+}
+
+/*
+* summary:
+*   Reads *entry_name* straight out of the already-opened zip archive into memory and
+*   parses it as XML, so no temporary file ever hits the disk. Uses zip_entry_read(),
+*   which allocates the (uncompressed) buffer for us in a single call; that buffer is
+*   then copied into a NUL-terminated string because sxmlc requires a C string and
+*   zip_entry_read() does not guarantee a trailing '\0'.
+*   (zip_entry_read() is preferred over zip_entry_noallocread() here: the latter would
+*   force a prior zip_entry_size() call plus a manual malloc, and we would still need the
+*   extra +1 NUL-terminated copy for sxmlc, so it brings no real benefit in this case.)
+* returns:
+*   -  1: success.
+*   -  0: entry absent or parse failure.
+*   - -1: zip read error or out of memory.
+*/
+static int parse_xml_from_zip(struct zip_t *zip, const char *entry_name, XMLDoc *doc)
+{
+  XMLDoc_init(doc);
+
+  if(zip_entry_open(zip, entry_name) != 0)
+    return 0; // entry absent (e.g. sharedStrings.xml legitimately missing when there are no strings)
+
+  void *buf = NULL;
+  size_t bufsize = 0;
+  ssize_t n = zip_entry_read(zip, &buf, &bufsize); // allocates *buf
+  zip_entry_close(zip);
+  if(n < 0 || !buf) {
+    free(buf);
+    return -1;
+  }
+
+  // sxmlc needs a NUL-terminated string; zip_entry_read() does not guarantee one
+  char *xml = malloc((size_t)n + 1);
+  if(!xml) {
+    free(buf);
+    return -1;
+  }
+  memcpy(xml, buf, (size_t)n);
+  xml[n] = '\0';
+  free(buf);
+
+  // *entry_name* is only used by sxmlc for the root document name / error reporting
+  int ok = XMLDoc_parse_buffer_DOM_text_as_nodes(xml, entry_name, doc, 0);
+  free(xml);
+  return ok ? 1 : 0;
+}
+
+/*
 * params:
 *   - src: source XLSX.
 *   - xlsx: handler. It will be written with data gathered after deploying the XLSX.
 * returns:
 *   - 1: everything went OK.
 *   - 0: the process FAILED. Compare xlsx_errno against enum xlsx_open_errno to know why.
+* notes:
+*   - Equivalent to xlsx_open_ex(src, xlsx, 0): deploys the XLSX to a temporary folder.
 */
 int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
+{
+  return xlsx_open_ex(src, xlsx, 0);
+}
+
+/*
+* See header for documentation.
+*/
+int xlsx_open_ex(const char *src, xlsx_workbook_t *xlsx, int in_memory)
 {
   xlsx_errno = 0;
 
@@ -46,6 +128,11 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
   }
 
   init_xlsx_workbook_t_struct(xlsx);
+
+  // ---- in-memory mode: open the archive and read entries from RAM, no temp file ----
+  if(in_memory)
+    return xlsx_open_in_memory(src, xlsx);
+  // ---- file mode (legacy): deploy the XLSX to a temporary folder ----
 
   // build the temporary path where the excel will be deployed (fallback to /tmp if env var not defined)
   const char *temp_path = getenv(ENVIRONMENT_VARIABLE_TEMP) ? getenv(ENVIRONMENT_VARIABLE_TEMP) : "/tmp";
@@ -99,33 +186,24 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
     xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
     return 0; // FAIL
   }
-  XMLDoc_init(xlsx->shared_strings_xml);
-#if defined(_MSC_VER)
-  char *path_to_shared_strings_xml = (char*)_alloca(strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_SHARED_STRINGS) + 1);
-#else
-  char path_to_shared_strings_xml[strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_SHARED_STRINGS) + 1];
-#endif
-  strcpy(path_to_shared_strings_xml, deployed_xlsx_path);
-  strcat(path_to_shared_strings_xml, REL_PATH_TO_SHARED_STRINGS);
-  // next function returns false if something went wrong in the parsing OR if the file doesn't exist, which may happen
-  // when the XLSX has no strings
-  if(!XMLDoc_parse_file_DOM(path_to_shared_strings_xml, xlsx->shared_strings_xml)) {
-    // if prev function fails, it calls XMLDoc_free(), so no need to call it again
+  // returns 0 if the parsing failed OR the file doesn't exist, which may happen when the XLSX has no strings
+  int shared_strings_rc =
+    parse_xml_from_deployment(deployed_xlsx_path, REL_PATH_TO_SHARED_STRINGS, xlsx->shared_strings_xml);
+  if(shared_strings_rc == -1) {
+    free(xlsx->shared_strings_xml);
+    xlsx->shared_strings_xml = NULL;
+    xlsx_close(xlsx);
+    xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
+    return 0; // FAIL
+  } else if(shared_strings_rc == 0) {
+    // sxmlc already freed the XMLDoc on parse failure; absent file is also fine
     free(xlsx->shared_strings_xml);
     xlsx->shared_strings_xml = NULL;
   }
 
   // load and parse a bit of styles.xml
   XMLDoc styles_xml;
-  XMLDoc_init(&styles_xml);
-#if defined(_MSC_VER)
-  char *path_to_styles_xml = (char*)_alloca(strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_STYLES) + 1);
-#else
-  char path_to_styles_xml[strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_STYLES) + 1];
-#endif
-  strcpy(path_to_styles_xml, deployed_xlsx_path);
-  strcat(path_to_styles_xml, REL_PATH_TO_STYLES);
-  if(!(XMLDoc_parse_file_DOM(path_to_styles_xml, &styles_xml))) {
+  if(parse_xml_from_deployment(deployed_xlsx_path, REL_PATH_TO_STYLES, &styles_xml) != 1) {
     xlsx_close(xlsx);
     if(xlsx_print_err_messages)
       fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", REL_PATH_TO_STYLES);
@@ -134,18 +212,112 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
     return 0; // FAIL
   }
 
+  // look for all sheets on the workbook and partially initialize the sheets members
+  XMLDoc workbook_xml;
+  if(parse_xml_from_deployment(deployed_xlsx_path, REL_PATH_TO_WORKBOOK, &workbook_xml) != 1) {
+    xlsx_close(xlsx);
+    if(xlsx_print_err_messages)
+      fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", REL_PATH_TO_WORKBOOK);
+    xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
+    XMLDoc_free(&workbook_xml);
+    XMLDoc_free(&styles_xml);
+    return 0; // FAIL
+  }
+
+  // shared processing: extract styles and sheet metadata from the two parsed XMLDocs.
+  // This frees both XMLDocs (and, on failure, calls xlsx_close()).
+  return process_styles_and_sheets(xlsx, &styles_xml, &workbook_xml);
+}
+
+/*
+* summary:
+*   Opens the XLSX archive and reads styles.xml, sharedStrings.xml and workbook.xml straight
+*   from memory (no temporary folder/file). The zip archive is kept open in xlsx->zip_archive
+*   so individual worksheets can be read on demand in parse_sheet().
+* returns:
+*   - 1: success.
+*   - 0: failure (xlsx_errno is set).
+*/
+static int xlsx_open_in_memory(const char *src, xlsx_workbook_t *xlsx)
+{
+  struct zip_t *zip = zip_open(src, 0, 'r');
+  if(!zip) {
+    if(xlsx_print_err_messages)
+      fprintf(stderr, "XLSX_C ERROR: \"%s\" couldn't be opened.\n", src);
+    xlsx_errno = XLSX_OPEN_ERRNO_CANT_DEPLOY_FILE;
+    return 0; // FAIL
+  }
+  xlsx->zip_archive = zip;
+
+  // load sharedStrings.xml (may legitimately be absent)
+  if(!(xlsx->shared_strings_xml = malloc(sizeof(XMLDoc)))) {
+    xlsx_close(xlsx);
+    xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
+    return 0; // FAIL
+  }
+  int shared_strings_rc = parse_xml_from_zip(zip, ZIP_ENTRY_SHARED_STRINGS, xlsx->shared_strings_xml);
+  if(shared_strings_rc == -1) {
+    free(xlsx->shared_strings_xml);
+    xlsx->shared_strings_xml = NULL;
+    xlsx_close(xlsx);
+    xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
+    return 0; // FAIL
+  } else if(shared_strings_rc == 0) {
+    free(xlsx->shared_strings_xml);
+    xlsx->shared_strings_xml = NULL;
+  }
+
+  // load styles.xml
+  XMLDoc styles_xml;
+  if(parse_xml_from_zip(zip, ZIP_ENTRY_STYLES, &styles_xml) != 1) {
+    xlsx_close(xlsx);
+    if(xlsx_print_err_messages)
+      fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", ZIP_ENTRY_STYLES);
+    xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
+    XMLDoc_free(&styles_xml);
+    return 0; // FAIL
+  }
+
+  // load workbook.xml
+  XMLDoc workbook_xml;
+  if(parse_xml_from_zip(zip, ZIP_ENTRY_WORKBOOK, &workbook_xml) != 1) {
+    xlsx_close(xlsx);
+    if(xlsx_print_err_messages)
+      fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", ZIP_ENTRY_WORKBOOK);
+    xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
+    XMLDoc_free(&workbook_xml);
+    XMLDoc_free(&styles_xml);
+    return 0; // FAIL
+  }
+
+  return process_styles_and_sheets(xlsx, &styles_xml, &workbook_xml);
+}
+
+/*
+* summary:
+*   Shared back-end of xlsx_open_ex()/xlsx_open_in_memory(): given the already-parsed
+*   styles.xml and workbook.xml documents, fills xlsx->styles and the sheet metadata.
+*   Always frees *styles_xml* and *workbook_xml* before returning; on failure it also
+*   calls xlsx_close() and sets xlsx_errno.
+* returns:
+*   - 1: success.
+*   - 0: failure.
+*/
+static int process_styles_and_sheets(xlsx_workbook_t *xlsx, XMLDoc *styles_xml, XMLDoc *workbook_xml)
+{
   // start the search for cellXfs
   XMLSearch search_engine;
   XMLSearch_init(&search_engine);
   XMLSearch_search_set_tag(&search_engine, STYLES_CELLXFS_TAG);
   // from the root tag
-  XMLNode *cell_xfs_node = XMLSearch_next(styles_xml.nodes[styles_xml.i_root], &search_engine);
+  XMLNode *cell_xfs_node = XMLSearch_next(styles_xml->nodes[styles_xml->i_root], &search_engine);
   if(!cell_xfs_node) {
     xlsx_close(xlsx);
     fprintf(stderr, "XLSX_C ERROR: \"%s\" node can't be found on \"%s\".\n", STYLES_CELLXFS_TAG, REL_PATH_TO_STYLES);
     xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
     XMLSearch_free(&search_engine, false);
-    XMLDoc_free(&styles_xml);
+    XMLDoc_free(styles_xml);
+    XMLDoc_free(workbook_xml);
     return 0; // FAIL
   }
 
@@ -155,7 +327,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
     xlsx_close(xlsx);
     xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
     XMLSearch_free(&search_engine, false);
-    XMLDoc_free(&styles_xml);
+    XMLDoc_free(styles_xml);
+    XMLDoc_free(workbook_xml);
     return 0; // FAIL
   }
 
@@ -170,7 +343,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
       xlsx_close(xlsx);
       xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
       XMLSearch_free(&search_engine, false);
-      XMLDoc_free(&styles_xml);
+      XMLDoc_free(styles_xml);
+      XMLDoc_free(workbook_xml);
       return 0; // FAIL
     }
     // zero initialize all its fields that need memory allocation
@@ -191,7 +365,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
                 STYLES_NUMFMTID_ATTR_NAME, STYLES_CELLXFS_TAG, REL_PATH_TO_STYLES);
       xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
       XMLSearch_free(&search_engine, false);
-      XMLDoc_free(&styles_xml);
+      XMLDoc_free(styles_xml);
+      XMLDoc_free(workbook_xml);
       return 0; // FAIL
     }
     // once *xf_node_numfmtid_value* was found, see if it points to the predefined ones,
@@ -209,14 +384,15 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
       XMLSearch_init(&search_engine);
       XMLSearch_search_set_tag(&search_engine, STYLES_NUMFMT_TAG);
       XMLSearch_search_add_attribute(&search_engine, STYLES_NUMFMTID_ATTR_NAME, xf_node_numfmtid_value, true);
-      if(!(num_fmt_node = XMLSearch_next(styles_xml.nodes[styles_xml.i_root], &search_engine))) {
+      if(!(num_fmt_node = XMLSearch_next(styles_xml->nodes[styles_xml->i_root], &search_engine))) {
         xlsx_close(xlsx);
         if(xlsx_print_err_messages)
           fprintf(stderr, "XLSX_C ERROR: There's no \"%s\" with \"%s\" equal to \"%s\" in \"%s\".\n",
                   STYLES_NUMFMT_TAG, STYLES_NUMFMTID_ATTR_NAME, xf_node_numfmtid_value, REL_PATH_TO_STYLES);
         xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
         XMLSearch_free(&search_engine, false);
-        XMLDoc_free(&styles_xml);
+        XMLDoc_free(styles_xml);
+        XMLDoc_free(workbook_xml);
         return 0; // FAIL
       }
       for(attr_index = (num_fmt_node->n_attributes - 1); attr_index >= 0; --attr_index) {
@@ -226,7 +402,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
             xlsx_close(xlsx);
             xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
             XMLSearch_free(&search_engine, false);
-            XMLDoc_free(&styles_xml);
+            XMLDoc_free(styles_xml);
+            XMLDoc_free(workbook_xml);
             return 0; // FAIL
           }
           strcpy(xlsx->styles[xf_index]->format_code, num_fmt_node->attributes[attr_index].value);
@@ -243,38 +420,20 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
                   STYLES_FORMATCODE_ATTR_NAME, STYLES_NUMFMT_TAG, REL_PATH_TO_STYLES);
         xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
         XMLSearch_free(&search_engine, false);
-        XMLDoc_free(&styles_xml);
+        XMLDoc_free(styles_xml);
+        XMLDoc_free(workbook_xml);
         return 0; // FAIL
       }
       XMLSearch_free(&search_engine, false);
     }
   }
 
-  // look for all sheets on the workbook and partially initialize the sheets members
-  XMLDoc workbook_xml;
-  XMLDoc_init(&workbook_xml);
-#if defined(_MSC_VER)
-  char *path_to_workbook_xml = (char*)_alloca(strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_WORKBOOK) + 1);
-#else
-  char path_to_workbook_xml[strlen(deployed_xlsx_path) + strlen(REL_PATH_TO_WORKBOOK) + 1];
-#endif
-  strcpy(path_to_workbook_xml, deployed_xlsx_path);
-  strcat(path_to_workbook_xml, REL_PATH_TO_WORKBOOK);
-  if(!(XMLDoc_parse_file_DOM(path_to_workbook_xml, &workbook_xml))) {
-    xlsx_close(xlsx);
-    if(xlsx_print_err_messages)
-      fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", REL_PATH_TO_WORKBOOK);
-    xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
-    XMLDoc_free(&workbook_xml);
-    XMLDoc_free(&styles_xml);
-    return 0; // FAIL
-  }
   // look for sheet elements
   XMLSearch_free(&search_engine, false);
   XMLSearch_init(&search_engine);
   XMLSearch_search_set_tag(&search_engine, WORKBOOK_SHEETS_TAG);
   // from the root tag
-  XMLNode *sheets_node = XMLSearch_next(workbook_xml.nodes[workbook_xml.i_root], &search_engine);
+  XMLNode *sheets_node = XMLSearch_next(workbook_xml->nodes[workbook_xml->i_root], &search_engine);
   if(!sheets_node) {
     xlsx_close(xlsx);
     if(xlsx_print_err_messages)
@@ -282,8 +441,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
               WORKBOOK_SHEETS_TAG, REL_PATH_TO_WORKBOOK);
     xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
     XMLSearch_free(&search_engine, false);
-    XMLDoc_free(&workbook_xml);
-    XMLDoc_free(&styles_xml);
+    XMLDoc_free(workbook_xml);
+    XMLDoc_free(styles_xml);
     return 0; // FAIL
   }
 
@@ -292,8 +451,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
     xlsx_close(xlsx);
     xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
     XMLSearch_free(&search_engine, false);
-    XMLDoc_free(&workbook_xml);
-    XMLDoc_free(&styles_xml);
+    XMLDoc_free(workbook_xml);
+    XMLDoc_free(styles_xml);
     return 0; // FAIL
   }
 
@@ -303,8 +462,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
       xlsx_close(xlsx);
       xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
       XMLSearch_free(&search_engine, false);
-      XMLDoc_free(&workbook_xml);
-      XMLDoc_free(&styles_xml);
+      XMLDoc_free(workbook_xml);
+      XMLDoc_free(styles_xml);
       return 0; // FAIL
     }
     // initialize all members of this *xlsx_sheet_t* struct
@@ -317,7 +476,8 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
           xlsx_close(xlsx);
           xlsx_errno = XLSX_OPEN_ERRNO_OUT_OF_MEMORY;
           XMLSearch_free(&search_engine, false);
-          XMLDoc_free(&workbook_xml);
+          XMLDoc_free(workbook_xml);
+          XMLDoc_free(styles_xml);
           return 0; // FAIL
         }
         strcpy(xlsx->sheets[sheet_index]->name, sheets_node->children[sheet_index]->attributes[attr_index].value);
@@ -331,15 +491,15 @@ int xlsx_open(const char *src, xlsx_workbook_t *xlsx)
                 WORKBOOK_NAME_ATTR_NAME, WORKBOOK_SHEETS_TAG, REL_PATH_TO_WORKBOOK);
       xlsx_errno = XLSX_OPEN_ERRNO_XML_PARSING_ERROR;
       XMLSearch_free(&search_engine, false);
-      XMLDoc_free(&workbook_xml);
-      XMLDoc_free(&styles_xml);
+      XMLDoc_free(workbook_xml);
+      XMLDoc_free(styles_xml);
       return 0; // FAIL
     }
   }
 
   XMLSearch_free(&search_engine, false);
-  XMLDoc_free(&workbook_xml);
-  XMLDoc_free(&styles_xml);
+  XMLDoc_free(workbook_xml);
+  XMLDoc_free(styles_xml);
   return 1;
 }
 
@@ -672,6 +832,12 @@ int xlsx_close(xlsx_workbook_t *deployed_xlsx)
     deployed_xlsx->deployment_path = NULL;
   }
 
+  // in-memory mode: close the archive that was kept open to read worksheets on demand
+  if(deployed_xlsx->zip_archive) {
+    zip_close(deployed_xlsx->zip_archive);
+    deployed_xlsx->zip_archive = NULL;
+  }
+
   return xlsx_delete_folder_res;
 }
 
@@ -681,6 +847,7 @@ int xlsx_close(xlsx_workbook_t *deployed_xlsx)
 
 static void init_xlsx_workbook_t_struct(xlsx_workbook_t *xlsx) {
   xlsx->deployment_path = NULL;
+  xlsx->zip_archive = NULL;
   xlsx->shared_strings_xml = NULL;
   xlsx->n_styles = 0;
   xlsx->styles = NULL;
@@ -876,23 +1043,43 @@ static int parse_sheet(int sheet_number, xlsx_sheet_t * sheet) {
     return 0; // FAIL
   }
 
-  XMLDoc_init(sheet_xml);
   char sheet_number_as_string[12]; // an int can't occupy more than 11 chars
   sprintf(sheet_number_as_string, "%d", sheet_number);
-  char path_to_sheet[260];
-  strcpy(path_to_sheet, sheet->xlsx->deployment_path);
-  strcat(path_to_sheet, REL_PATH_TO_WORKSHEETS);
-  strcat(path_to_sheet, "sheet");
-  strcat(path_to_sheet, sheet_number_as_string);
-  strcat(path_to_sheet, ".xml");
 
-  if(!(XMLDoc_parse_file_DOM(path_to_sheet, sheet_xml))) {
-    XMLDoc_free(sheet_xml);
-    free(sheet_xml);
-    if(xlsx_print_err_messages)
-      fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", path_to_sheet);
-    xlsx_errno = XLSX_LOAD_SHEET_ERRNO_XML_PARSING_ERROR;
-    return 0; // FAIL
+  int parse_rc;
+  if(sheet->xlsx->zip_archive) {
+    // in-memory mode: read "xl/worksheets/sheetN.xml" straight from the archive
+    char zip_entry[64];
+    strcpy(zip_entry, ZIP_ENTRY_WORKSHEETS_PREFIX);
+    strcat(zip_entry, sheet_number_as_string);
+    strcat(zip_entry, ".xml");
+    parse_rc = parse_xml_from_zip(sheet->xlsx->zip_archive, zip_entry, sheet_xml);
+    if(parse_rc != 1) {
+      XMLDoc_free(sheet_xml);
+      free(sheet_xml);
+      if(xlsx_print_err_messages)
+        fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", zip_entry);
+      xlsx_errno = (parse_rc == -1) ? XLSX_LOAD_SHEET_ERRNO_OUT_OF_MEMORY : XLSX_LOAD_SHEET_ERRNO_XML_PARSING_ERROR;
+      return 0; // FAIL
+    }
+  } else {
+    // file mode: parse the deployed worksheet file
+    XMLDoc_init(sheet_xml);
+    char path_to_sheet[260];
+    strcpy(path_to_sheet, sheet->xlsx->deployment_path);
+    strcat(path_to_sheet, REL_PATH_TO_WORKSHEETS);
+    strcat(path_to_sheet, "sheet");
+    strcat(path_to_sheet, sheet_number_as_string);
+    strcat(path_to_sheet, ".xml");
+
+    if(!(XMLDoc_parse_file_DOM(path_to_sheet, sheet_xml))) {
+      XMLDoc_free(sheet_xml);
+      free(sheet_xml);
+      if(xlsx_print_err_messages)
+        fprintf(stderr, "XLSX_C ERROR: \"%s\" can't be parsed or doesn't exist.\n", path_to_sheet);
+      xlsx_errno = XLSX_LOAD_SHEET_ERRNO_XML_PARSING_ERROR;
+      return 0; // FAIL
+    }
   }
 
   // initialize references_to_rows_ll

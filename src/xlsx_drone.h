@@ -83,6 +83,11 @@ extern "C" {
   #define REL_PATH_TO_WORKSHEETS "/xl/worksheets/"
 #endif
 #define STYLES_CELLXFS_TAG "cellXfs"
+// zip-internal entry names: always use '/' regardless of the host OS, and no leading separator
+#define ZIP_ENTRY_STYLES "xl/styles.xml"
+#define ZIP_ENTRY_SHARED_STRINGS "xl/sharedStrings.xml"
+#define ZIP_ENTRY_WORKBOOK "xl/workbook.xml"
+#define ZIP_ENTRY_WORKSHEETS_PREFIX "xl/worksheets/sheet"
 #define STYLES_NUMFMT_TAG "numFmt"
 #define AMOUNT_OF_PREDEFINED_STYLE_TYPES 50
 #define STYLES_NUMFMTID_ATTR_NAME "numFmtId"
@@ -102,7 +107,8 @@ extern "C" {
 // structures
 // represents a workbook
 typedef struct xlsx_workbook_t {
-  char *deployment_path;
+  char *deployment_path;       // NULL in in-memory mode (no temporary folder created)
+  struct zip_t *zip_archive;   // NULL in file mode; kept open in in-memory mode to read sheets on demand
   XMLDoc *shared_strings_xml;
   int n_styles;
   struct xlsx_style_t **styles;
@@ -311,8 +317,27 @@ int xlsx_get_xlsx_errno(void);
 * returns:
 *   - 1: everything went OK.
 *   - 0: the process FAILED. Compare xlsx_errno against enum xlsx_open_errno to know why.
+* notes:
+*   - This is equivalent to xlsx_open_ex(src, xlsx, 0): it deploys the XLSX to a temporary
+*     folder on disk (legacy behaviour).
 */
 int xlsx_open(const char *src, xlsx_workbook_t *xlsx);
+
+/*
+* summary:
+*   Same as xlsx_open(), but lets you choose whether the XLSX is deployed to a temporary
+*   folder on disk, or read entirely from memory (no temporary file created).
+* params:
+*   - src: source XLSX.
+*   - xlsx: handler.
+*   - in_memory: pass 0 to deploy to a temporary folder (legacy behaviour); pass a non-zero
+*     value to read the archive directly from memory (no temporary file is created; the
+*     underlying zip archive is kept open until xlsx_close()).
+* returns:
+*   - 1: everything went OK.
+*   - 0: the process FAILED. Compare xlsx_errno against enum xlsx_open_errno to know why.
+*/
+int xlsx_open_ex(const char *src, xlsx_workbook_t *xlsx, int in_memory);
 
 enum xlsx_open_errno {
   XLSX_OPEN_ERRNO_MALFORMED_PARAMS = -1,
@@ -413,6 +438,10 @@ enum xlsx_read_cell_errno {
 int xlsx_close(xlsx_workbook_t *deployed_xlsx);
 
 // private
+static int xlsx_open_in_memory(const char *src, xlsx_workbook_t *xlsx);
+static int process_styles_and_sheets(xlsx_workbook_t *xlsx, XMLDoc *styles_xml, XMLDoc *workbook_xml);
+static int parse_xml_from_deployment(const char *deployment_path, const char *rel_path, XMLDoc *doc);
+static int parse_xml_from_zip(struct zip_t *zip, const char *entry_name, XMLDoc *doc);
 static void init_xlsx_workbook_t_struct(xlsx_workbook_t *xlsx);
 static void init_xlsx_sheet_t_struct(xlsx_sheet_t *sheet, xlsx_workbook_t *deployed_xlsx);
 static xlsx_cell_category get_related_category(const char *format_code, int format_code_length);
